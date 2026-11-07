@@ -347,7 +347,10 @@ VkImageCreateInfo imageInfoFromDesc(const chi::ResourceDescription& desc)
     info.mipLevels = 1;
     info.arrayLayers = 1;
     info.samples = VK_SAMPLE_COUNT_1_BIT;
-    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // A depth image cannot be a storage image. Claiming storage would make FFX treat it as a UAV.
+    if (!ffxApiIsDepthFormat(info.format))
+        info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     return info;
 }
 
@@ -384,7 +387,11 @@ FfxApiResource wrapAndTransition(fsr::FSRContext& ctx, VkCommandBuffer cmd, Comm
     VkImage image = (VkImage)res->native;
     VkImageLayout cur = (VkImageLayout)res->state;
     VkImageLayout want = ffxStateToLayout(ffxState);
+    // A depth-stencil image's layout covers both aspects unless separateDepthStencilLayouts is enabled
+    // (VUID-VkImageMemoryBarrier-image-03320). AMD backs D24S8 with D32_SFLOAT_S8_UINT.
     VkImageAspectFlags aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    if (depth && ffxApiIsStencilFormat((VkFormat)desc.nativeFormat))
+        aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
     if (cur != want) {
         recordBarrier(ctx, cmd, { image, cur, want, aspect });
         restore.push_back({ image, want, cur, aspect });
