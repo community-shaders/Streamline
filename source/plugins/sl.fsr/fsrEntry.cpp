@@ -464,6 +464,14 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     config.at("appId").get_to(appId);
     config.at("deviceType").get_to(deviceType);
     ctx.platform = (RenderAPI)deviceType;
+    // D3D12 is not supported yet: the plugin turns itself off by name, so the host sees the feature as unavailable
+    // instead of evaluations that fail one by one.
+    if (ctx.platform != RenderAPI::eVulkan)
+    {
+        SL_LOG_WARN("sl.fsr: off, the device is not Vulkan (deviceType %u): FidelityFX's Vulkan backend (amd_fidelityfx_vk.dll) is the only one built into it", deviceType);
+        ctx.registerEvaluateCallbacks(kFeatureFSR, nullptr, nullptr);
+        return false;
+    }
 
     if (!param::getPointerParam(parameters, sl::param::common::kComputeAPI, &ctx.compute))
     {
