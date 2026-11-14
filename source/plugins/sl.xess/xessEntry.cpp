@@ -1,7 +1,9 @@
 /*
 * Community Shaders sl.xess plugin — Intel XeSS super-resolution upscaling.
 *
-* Drives XeSS (libxess.dll, Vulkan backend) on DXVK's VkDevice through Streamline's evaluate mechanism.
+* Drives XeSS (libxess.dll) through Streamline's evaluate mechanism: its Vulkan entry points on a Vulkan device (DXVK's, or a
+* native one), its D3D12 entry points on a D3D12 device. On D3D12 the host leaves the inputs in a shader-read state and the output
+* in UNORDERED_ACCESS, the states xessD3D12Execute takes, so the plugin records no barriers there.
 * The host tags ScalingInputColor / ScalingOutputColor / Depth / MotionVectors + sets common Constants
 * (jitter) and calls slEvaluateFeature(kFeatureXeSS); xessEndEvaluation records xessVKExecute onto the
 * SL-provided command list. Upscale-only (no frame generation).
@@ -31,6 +33,7 @@
 #include "xess/xess.h"
 #undef XESS_TYPES_ONLY
 #include "xess/xess_vk.h"
+#include "xess/xess_d3d12.h"
 
 using json = nlohmann::json;
 
@@ -49,6 +52,11 @@ struct XeSSApi
     xess_result_t (*vkExecute)(xess_context_handle_t, VkCommandBuffer, const xess_vk_execute_params_t*) = nullptr;
     xess_result_t (*setVelocityScale)(xess_context_handle_t, float, float) = nullptr;
     xess_result_t (*destroyContext)(xess_context_handle_t) = nullptr;
+    // D3D12 entry points (the same libxess.dll).
+    xess_result_t (*d3d12CreateContext)(ID3D12Device*, xess_context_handle_t*) = nullptr;
+    xess_result_t (*d3d12BuildPipelines)(xess_context_handle_t, ID3D12PipelineLibrary*, bool, uint32_t) = nullptr;
+    xess_result_t (*d3d12Init)(xess_context_handle_t, const xess_d3d12_init_params_t*) = nullptr;
+    xess_result_t (*d3d12Execute)(xess_context_handle_t, ID3D12GraphicsCommandList*, const xess_d3d12_execute_params_t*) = nullptr;
 };
 
 struct XeSSContext
@@ -114,14 +122,21 @@ bool loadXeSS(xess::XeSSApi& api)
         SL_LOG_WARN("sl.xess: libxess.dll not found next to the plugin — XeSS disabled");
         return false;
     }
+    const bool d3d12 = (*xess::getContext()).platform == RenderAPI::eD3D12;
     bool ok =
         resolve(api.module, api.getVersion, "xessGetVersion") &&
-        resolve(api.module, api.vkCreateContext, "xessVKCreateContext") &&
-        resolve(api.module, api.vkBuildPipelines, "xessVKBuildPipelines") &&
-        resolve(api.module, api.vkInit, "xessVKInit") &&
-        resolve(api.module, api.vkExecute, "xessVKExecute") &&
         resolve(api.module, api.setVelocityScale, "xessSetVelocityScale") &&
         resolve(api.module, api.destroyContext, "xessDestroyContext");
+    if (ok && d3d12)
+        ok = resolve(api.module, api.d3d12CreateContext, "xessD3D12CreateContext") &&
+             resolve(api.module, api.d3d12BuildPipelines, "xessD3D12BuildPipelines") &&
+             resolve(api.module, api.d3d12Init, "xessD3D12Init") &&
+             resolve(api.module, api.d3d12Execute, "xessD3D12Execute");
+    else if (ok)
+        ok = resolve(api.module, api.vkCreateContext, "xessVKCreateContext") &&
+             resolve(api.module, api.vkBuildPipelines, "xessVKBuildPipelines") &&
+             resolve(api.module, api.vkInit, "xessVKInit") &&
+             resolve(api.module, api.vkExecute, "xessVKExecute");
     if (!ok)
     {
         FreeLibrary(api.module);
@@ -161,16 +176,24 @@ bool ensureContext(xess::XeSSContext& ctx, uint32_t outputWidth, uint32_t output
         ctx.xessContext = nullptr;
     }
 
-    chi::Device device{}; chi::Instance instance{}; chi::PhysicalDevice physical{};
-    ctx.compute->getInstance(instance);
+    const bool d3d12 = ctx.platform == RenderAPI::eD3D12;
+    chi::Device device{};
     ctx.compute->getDevice(device);
-    ctx.compute->getPhysicalDevice(physical);
-
-    xess_result_t r = ctx.api.vkCreateContext(
-        (VkInstance)instance, (VkPhysicalDevice)physical, (VkDevice)device, &ctx.xessContext);
+    xess_result_t r = XESS_RESULT_ERROR_UNKNOWN;
+    if (d3d12)
+    {
+        r = ctx.api.d3d12CreateContext((ID3D12Device*)device, &ctx.xessContext);
+    }
+    else
+    {
+        chi::Instance instance{}; chi::PhysicalDevice physical{};
+        ctx.compute->getInstance(instance);
+        ctx.compute->getPhysicalDevice(physical);
+        r = ctx.api.vkCreateContext((VkInstance)instance, (VkPhysicalDevice)physical, (VkDevice)device, &ctx.xessContext);
+    }
     if (r != XESS_RESULT_SUCCESS)
     {
-        SL_LOG_ERROR("sl.xess: xessVKCreateContext failed (%d)", (int)r);
+        SL_LOG_ERROR("sl.xess: %s failed (%d)", d3d12 ? "xessD3D12CreateContext" : "xessVKCreateContext", (int)r);
         ctx.xessContext = nullptr;
         return false;
     }
@@ -185,13 +208,24 @@ bool ensureContext(xess::XeSSContext& ctx, uint32_t outputWidth, uint32_t output
     //     the flag wrongly set, XeSS reads the depth convention backwards and fails disocclusion rejection,
     //     so revealed geometry on large depth discontinuities keeps stale history → fuzzy/smeared.
     const uint32_t initFlags = XESS_INIT_FLAG_ENABLE_AUTOEXPOSURE;
-    ctx.api.vkBuildPipelines(ctx.xessContext, VK_NULL_HANDLE, true, initFlags);
-
-    xess_vk_init_params_t init{};
-    init.outputResolution = { outputWidth, outputHeight };
-    init.qualitySetting = mapQuality(mode);
-    init.initFlags = initFlags;
-    r = ctx.api.vkInit(ctx.xessContext, &init);
+    if (d3d12)
+    {
+        ctx.api.d3d12BuildPipelines(ctx.xessContext, nullptr, true, initFlags);
+        xess_d3d12_init_params_t init{};
+        init.outputResolution = { outputWidth, outputHeight };
+        init.qualitySetting = mapQuality(mode);
+        init.initFlags = initFlags;
+        r = ctx.api.d3d12Init(ctx.xessContext, &init);
+    }
+    else
+    {
+        ctx.api.vkBuildPipelines(ctx.xessContext, VK_NULL_HANDLE, true, initFlags);
+        xess_vk_init_params_t init{};
+        init.outputResolution = { outputWidth, outputHeight };
+        init.qualitySetting = mapQuality(mode);
+        init.initFlags = initFlags;
+        r = ctx.api.vkInit(ctx.xessContext, &init);
+    }
     if (r != XESS_RESULT_SUCCESS)
     {
         SL_LOG_ERROR("sl.xess: xessVKInit failed (%d)", (int)r);
@@ -272,7 +306,7 @@ sl::Result xessBeginEvaluation(chi::CommandList /*pCmdList*/, const common::Even
 sl::Result xessEndEvaluation(chi::CommandList cmdList, const common::EventData& evd, const sl::BaseStructure** inputs, uint32_t numInputs)
 {
     auto& ctx = (*xess::getContext());
-    if (ctx.dispatchFaulted || ctx.platform != RenderAPI::eVulkan)
+    if (ctx.dispatchFaulted || (ctx.platform != RenderAPI::eVulkan && ctx.platform != RenderAPI::eD3D12))
         return Result::eErrorNotInitialized;
     // Load libxess.dll LAZILY on the first evaluate — NEVER during slOnPluginStartup, which runs inside the
     // interposed vkCreateDevice; libxess enumerating Vulkan on load would re-enter vkCreateDevice ->
@@ -321,6 +355,34 @@ sl::Result xessEndEvaluation(chi::CommandList cmdList, const common::EventData& 
     // Set per-frame (not at context creation) because the render size varies with dynamic resolution while
     // the context, keyed on output size + quality, is not recreated.
     ctx.api.setVelocityScale(ctx.xessContext, (float)renderW, (float)renderH);
+
+    // D3D12: the tagged resources as the host left them (inputs readable, the output in UNORDERED_ACCESS).
+    if (ctx.platform == RenderAPI::eD3D12)
+    {
+        const auto native = [](CommonResource& cr) {
+            chi::Resource res = cr;
+            return res ? static_cast<ID3D12Resource*>(res->native) : nullptr;
+        };
+        xess_d3d12_execute_params_t d3dParams{};
+        d3dParams.pColorTexture = native(colorIn);
+        d3dParams.pVelocityTexture = native(mvec);
+        d3dParams.pDepthTexture = native(depth);
+        d3dParams.pOutputTexture = native(colorOut);
+        d3dParams.jitterOffsetX = consts->jitterOffset.x;
+        d3dParams.jitterOffsetY = consts->jitterOffset.y;
+        d3dParams.exposureScale = 1.0f;
+        d3dParams.resetHistory = consts->reset == Boolean::eTrue;
+        d3dParams.inputWidth = renderW;
+        d3dParams.inputHeight = renderH;
+        const xess_result_t d3dResult = ctx.api.d3d12Execute(ctx.xessContext, static_cast<ID3D12GraphicsCommandList*>(cmdList), &d3dParams);
+        if (d3dResult != XESS_RESULT_SUCCESS)
+        {
+            SL_LOG_ERROR("sl.xess: xessD3D12Execute failed (%d) — disabling for this session", (int)d3dResult);
+            ctx.dispatchFaulted = true;
+            return Result::eErrorExceptionHandler;
+        }
+        return Result::eOk;
+    }
 
     xess_vk_execute_params_t params{};
     params.colorTexture = makeViewInfo(ctx.compute, colorIn, renderW, renderH, false);
@@ -423,11 +485,11 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     config.at("appId").get_to(appId);
     config.at("deviceType").get_to(deviceType);
     ctx.platform = (RenderAPI)deviceType;
-    // D3D12 is not supported yet: the plugin turns itself off by name, so the host sees the feature as unavailable
-    // instead of evaluations that fail one by one.
-    if (ctx.platform != RenderAPI::eVulkan)
+    // Vulkan and D3D12 (libxess.dll's xessD3D12* entry points). Anything else turns the plugin off by name, so the host sees the
+    // feature as unavailable instead of evaluations that fail one by one.
+    if (ctx.platform != RenderAPI::eVulkan && ctx.platform != RenderAPI::eD3D12)
     {
-        SL_LOG_WARN("sl.xess: off, the device is not Vulkan (deviceType %u): only XeSS's Vulkan entry points (libxess.dll's xessVK*) are wired into it", deviceType);
+        SL_LOG_WARN("sl.xess: off, the device is neither Vulkan nor D3D12 (deviceType %u)", deviceType);
         ctx.registerEvaluateCallbacks(kFeatureXeSS, nullptr, nullptr);
         return false;
     }
@@ -436,6 +498,11 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     {
         SL_LOG_ERROR("sl.xess: failed to obtain compute interface");
         return false;
+    }
+    if (ctx.platform == RenderAPI::eD3D12)
+    {
+        SL_LOG_INFO("sl.xess plugin started (D3D12)");
+        return true;
     }
 
     wchar_t systemDirectory[MAX_PATH]{};

@@ -1,7 +1,9 @@
 /*
 * Community Shaders sl.fsr plugin — AMD FidelityFX FSR3 upscaling ONLY (feature kFeatureFSR).
 *
-* Drives FFX-API (amd_fidelityfx_vk.dll) on DXVK's VkDevice through Streamline's evaluate mechanism.
+* Drives FFX-API through Streamline's evaluate mechanism: amd_fidelityfx_vk.dll on a Vulkan device (DXVK's, or a native one),
+* amd_fidelityfx_dx12.dll on a D3D12 device. On D3D12 the host leaves the inputs in a shader-read state and the output in
+* UNORDERED_ACCESS, and FFX's own backend moves what it needs, so the plugin records no barriers there.
 * The host tags ScalingInputColor / ScalingOutputColor / Depth / MotionVectors + sets common Constants
 * (jitter, camera) and calls slEvaluateFeature(kFeatureFSR); fsrEndEvaluation records ffxDispatch(upscale)
 * onto the SL-provided command buffer. FSR3 FRAME GENERATION lives in a SEPARATE, independently-loadable
@@ -36,6 +38,7 @@
 #include "ffx_api/ffx_api_loader.h"
 #include "ffx_api/ffx_upscale.h"
 #include "ffx_api/vk/ffx_api_vk.h"
+#include "source/plugins/sl.fsr/fsrDX12.h"
 
 using json = nlohmann::json;
 
@@ -189,20 +192,21 @@ bool loadFFX(fsr::FSRContext& ctx)
 {
     if (ctx.ffxModule)
         return true;
-    std::wstring dll = getPluginDir() + L"\\amd_fidelityfx_vk.dll";
+    const wchar_t* name = ctx.platform == RenderAPI::eD3D12 ? L"amd_fidelityfx_dx12.dll" : L"amd_fidelityfx_vk.dll";
+    std::wstring dll = getPluginDir() + L"\\" + name;
     ctx.ffxModule = LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!ctx.ffxModule) {
-        SL_LOG_WARN("sl.fsr: amd_fidelityfx_vk.dll not found next to the plugin — FSR disabled");
+        SL_LOG_WARN("sl.fsr: %S not found next to the plugin — FSR disabled", name);
         return false;
     }
     ffxLoadFunctions(&ctx.ffxApi, ctx.ffxModule);
     if (!ctx.ffxApi.CreateContext || !ctx.ffxApi.DestroyContext || !ctx.ffxApi.Configure || !ctx.ffxApi.Dispatch) {
-        SL_LOG_ERROR("sl.fsr: amd_fidelityfx_vk.dll missing FFX-API entry points");
+        SL_LOG_ERROR("sl.fsr: %S missing FFX-API entry points", name);
         FreeLibrary(ctx.ffxModule);
         ctx.ffxModule = nullptr;
         return false;
     }
-    SL_LOG_INFO("sl.fsr: loaded amd_fidelityfx_vk.dll");
+    SL_LOG_INFO("sl.fsr: loaded %S", name);
     return true;
 }
 
@@ -217,21 +221,28 @@ bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t rende
         ctx.upscaleContext = nullptr;
     }
 
-    chi::Device device{}; chi::PhysicalDevice physical{};
+    chi::Device device{};
     ctx.compute->getDevice(device);
-    ctx.compute->getPhysicalDevice(physical);
 
     ffxCreateBackendVKDesc backendDesc{};
-    backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
-    backendDesc.header.pNext = nullptr;
-    backendDesc.vkDevice = (VkDevice)device;
-    backendDesc.vkPhysicalDevice = (VkPhysicalDevice)physical;
-    g_realDeviceProcAddr = ctx.realDeviceProcAddr;
-    backendDesc.vkDeviceProcAddr = &DxvkFfxGetDeviceProcAddr;
+    ffxCreateContextDescHeader* backend = nullptr;
+    if (ctx.platform == RenderAPI::eD3D12) {
+        backend = fsr::backendDescDX12(device);
+    } else {
+        chi::PhysicalDevice physical{};
+        ctx.compute->getPhysicalDevice(physical);
+        backendDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+        backendDesc.header.pNext = nullptr;
+        backendDesc.vkDevice = (VkDevice)device;
+        backendDesc.vkPhysicalDevice = (VkPhysicalDevice)physical;
+        g_realDeviceProcAddr = ctx.realDeviceProcAddr;
+        backendDesc.vkDeviceProcAddr = &DxvkFfxGetDeviceProcAddr;
+        backend = &backendDesc.header;
+    }
 
     ffxCreateContextDescUpscale upscaleDesc{};
     upscaleDesc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    upscaleDesc.header.pNext = &backendDesc.header;
+    upscaleDesc.header.pNext = backend;
     // Skyrim's depth is standard [0=near .. 1=far], not reversed-Z, so no FFX_UPSCALE_ENABLE_DEPTH_INVERTED.
     upscaleDesc.flags = FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
         (colorHDR ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0);
@@ -278,6 +289,15 @@ FfxApiResource wrapAndTransition(fsr::FSRContext& ctx, VkCommandBuffer cmd, Comm
     return ffxApiGetResourceVK(reinterpret_cast<void*>(image), fdesc, ffxState);
 }
 
+// D3D12: the tagged ID3D12Resource in the state the host left it in (its tag's legacy state): a shader-read state for an input,
+// UNORDERED_ACCESS for the output. FFX's DX12 backend reads the description from the resource.
+FfxApiResource wrapD3D12(CommonResource& cr, bool output)
+{
+    chi::Resource res = cr;
+    const uint32_t state = output ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS : FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
+    return fsr::resourceDX12(res ? res->native : nullptr, state);
+}
+
 }
 
 sl::Result fsrBeginEvaluation(chi::CommandList /*pCmdList*/, const common::EventData& /*evd*/, const sl::BaseStructure** /*inputs*/, uint32_t /*numInputs*/)
@@ -288,7 +308,7 @@ sl::Result fsrBeginEvaluation(chi::CommandList /*pCmdList*/, const common::Event
 sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& evd, const sl::BaseStructure** inputs, uint32_t numInputs)
 {
     auto& ctx = (*fsr::getContext());
-    if (ctx.dispatchFaulted || ctx.platform != RenderAPI::eVulkan)
+    if (ctx.dispatchFaulted || (ctx.platform != RenderAPI::eVulkan && ctx.platform != RenderAPI::eD3D12))
         return Result::eErrorNotInitialized;
     if (!ctx.ffxModule && !loadFFX(ctx))  // lazy load (never in slOnPluginStartup — vkCreateDevice re-entrancy)
         return Result::eErrorNotInitialized;
@@ -337,10 +357,13 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
 
     VkCommandBuffer cmd = (VkCommandBuffer)cmdList;
     std::vector<Barrier> restore;
+    const bool d3d12 = ctx.platform == RenderAPI::eD3D12;
 
-    // Depth + MV feed the upscale; wrap+transition once.
-    FfxApiResource depthRes = wrapAndTransition(ctx, cmd, depth, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_DEPTHTARGET, true, restore);
-    FfxApiResource mvecRes = wrapAndTransition(ctx, cmd, mvec, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
+    // Depth + MV feed the upscale; wrap+transition once (D3D12: as the host left them).
+    FfxApiResource depthRes = d3d12 ? wrapD3D12(depth, false) :
+        wrapAndTransition(ctx, cmd, depth, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_DEPTHTARGET, true, restore);
+    FfxApiResource mvecRes = d3d12 ? wrapD3D12(mvec, false) :
+        wrapAndTransition(ctx, cmd, mvec, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
     // The motion-vector resource MUST carry the SAME dimensions/subrect as depth — FFX reconstructs MV against
     // the depth grid, so a size mismatch (e.g. a full-res MV texture vs a render-res depth) misaligns the
     // dilation and leaves MV not covering the frame. Force MV's description to depth's so they're sampled
@@ -357,14 +380,18 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     {
         ffxDispatchDescUpscale dp{};
         dp.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
-        dp.commandList = reinterpret_cast<void*>(cmd);
-        dp.color = wrapAndTransition(ctx, cmd, colorIn, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
+        dp.commandList = reinterpret_cast<void*>(cmdList);
+        dp.color = d3d12 ? wrapD3D12(colorIn, false) :
+            wrapAndTransition(ctx, cmd, colorIn, FFX_API_RESOURCE_STATE_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY, false, restore);
         dp.depth = depthRes;
         dp.motionVectors = mvecRes;
-        dp.reactive = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        dp.transparencyAndComposition = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        dp.exposure = ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-        dp.output = wrapAndTransition(ctx, cmd, colorOut, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV, false, restore);
+        const FfxApiResource none = d3d12 ? fsr::resourceDX12(nullptr, FFX_API_RESOURCE_STATE_COMPUTE_READ) :
+            ffxApiGetResourceVK(nullptr, {}, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        dp.reactive = none;
+        dp.transparencyAndComposition = none;
+        dp.exposure = none;
+        dp.output = d3d12 ? wrapD3D12(colorOut, true) :
+            wrapAndTransition(ctx, cmd, colorOut, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV, false, restore);
         dp.motionVectorScale = motionVectorScale;
         dp.renderSize = { renderW, renderH };
         dp.upscaleSize = { outputW, outputH };
@@ -464,11 +491,11 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     config.at("appId").get_to(appId);
     config.at("deviceType").get_to(deviceType);
     ctx.platform = (RenderAPI)deviceType;
-    // D3D12 is not supported yet: the plugin turns itself off by name, so the host sees the feature as unavailable
-    // instead of evaluations that fail one by one.
-    if (ctx.platform != RenderAPI::eVulkan)
+    // Vulkan and D3D12 (FidelityFX's DX12 backend, amd_fidelityfx_dx12.dll). Anything else turns the plugin off by name, so the host
+    // sees the feature as unavailable instead of evaluations that fail one by one.
+    if (ctx.platform != RenderAPI::eVulkan && ctx.platform != RenderAPI::eD3D12)
     {
-        SL_LOG_WARN("sl.fsr: off, the device is not Vulkan (deviceType %u): FidelityFX's Vulkan backend (amd_fidelityfx_vk.dll) is the only one built into it", deviceType);
+        SL_LOG_WARN("sl.fsr: off, the device is neither Vulkan nor D3D12 (deviceType %u)", deviceType);
         ctx.registerEvaluateCallbacks(kFeatureFSR, nullptr, nullptr);
         return false;
     }
@@ -477,6 +504,11 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     {
         SL_LOG_ERROR("sl.fsr: failed to obtain compute interface");
         return false;
+    }
+    if (ctx.platform == RenderAPI::eD3D12)
+    {
+        SL_LOG_INFO("sl.fsr plugin started (D3D12)");
+        return true;
     }
 
     // Resolve the REAL (un-interposed) device functions for the FFX backend + our barriers from the GENUINE
