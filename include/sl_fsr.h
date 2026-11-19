@@ -28,7 +28,7 @@ enum class FSRMode : uint32_t
 };
 
 // {B1F2A9C0-3D4E-4A5B-9C6D-7E8F90A1B2C3}
-SL_STRUCT_BEGIN(FSROptions, StructType({ 0xb1f2a9c0, 0x3d4e, 0x4a5b, { 0x9c, 0x6d, 0x7e, 0x8f, 0x90, 0xa1, 0xb2, 0xc3 } }), kStructVersion1)
+SL_STRUCT_BEGIN(FSROptions, StructType({ 0xb1f2a9c0, 0x3d4e, 0x4a5b, { 0x9c, 0x6d, 0x7e, 0x8f, 0x90, 0xa1, 0xb2, 0xc3 } }), kStructVersion2)
     //! Which quality mode to use (eOff disables the feature for this viewport).
     FSRMode mode = FSRMode::eOff;
     //! Final output (display) target width.
@@ -39,6 +39,8 @@ SL_STRUCT_BEGIN(FSROptions, StructType({ 0xb1f2a9c0, 0x3d4e, 0x4a5b, { 0x9c, 0x6
     float sharpness = 0.0f;
     //! Whether the tagged color buffers are HDR (affects FFX tonemap handling).
     Boolean colorBuffersHDR = Boolean::eFalse;
+    //! Version 2: the factor the host already multiplied into the input color, which FSR divides out.
+    float preExposure = 1.0f;
     //! IMPORTANT: New members go here or chain a new struct (see sl_struct.h).
 SL_STRUCT_END()
 

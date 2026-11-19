@@ -10,6 +10,7 @@
 * plugin (kFeatureFSR_G / sl.fsr_g), a structural twin of sl.dlss_g — see source/plugins/sl.fsr_g.
 */
 
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <atomic>
@@ -367,6 +368,7 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
     // running the epilogue restore loop, so doing them first is what keeps the depth/MV transitions
     // from leaking and desyncing DXVK's image-layout tracking.
     float sharpness = 0.0f;
+    float preExposure = 1.0f;
     bool colorHDR = false;
     {
         std::lock_guard<std::mutex> lock(ctx.optionsMutex);
@@ -375,6 +377,7 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             if (it->second.mode == FSRMode::eOff)
                 return Result::eOk;
             sharpness = it->second.sharpness;
+            preExposure = it->second.preExposure;
             colorHDR = it->second.colorBuffersHDR == Boolean::eTrue;
         }
     }
@@ -448,7 +451,7 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
         // Honor the host's camera-cut/reset signal (teleport, fast-travel, menu->game) so FSR flushes its
         // temporal history for one frame instead of smearing the discontinuity.
         dp.reset = (consts->reset == Boolean::eTrue);
-        dp.preExposure = 1.0f;
+        dp.preExposure = preExposure;
         dp.flags = 0;
         rc = ffxDispatchSEH(ctx.ffxApi, &ctx.upscaleContext, &dp.header);
 
@@ -470,8 +473,17 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
 sl::Result slFSRSetOptions(const sl::ViewportHandle& viewport, const sl::FSROptions& options)
 {
     auto& ctx = (*fsr::getContext());
+    // A version 1 caller's struct ends before preExposure, so copy the members it has.
+    FSROptions stored{};
+    stored.mode = options.mode;
+    stored.outputWidth = options.outputWidth;
+    stored.outputHeight = options.outputHeight;
+    stored.sharpness = options.sharpness;
+    stored.colorBuffersHDR = options.colorBuffersHDR;
+    if (options.structVersion >= kStructVersion2 && std::isfinite(options.preExposure) && options.preExposure > 0.0f)
+        stored.preExposure = options.preExposure;
     std::lock_guard<std::mutex> lock(ctx.optionsMutex);
-    ctx.upscaleOptions[(uint32_t)viewport] = options;
+    ctx.upscaleOptions[(uint32_t)viewport] = stored;
     return Result::eOk;
 }
 
