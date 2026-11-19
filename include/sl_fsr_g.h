@@ -30,6 +30,9 @@ SL_STRUCT_BEGIN(FSRFrameGenOptions, StructType({ 0xe4c5d6f7, 0x8091, 0x42a3, { 0
     //! misreads every field after it across the plugin ABI boundary.
     float pacingSafetyMarginMs = 0.0f;
     float pacingVarianceFactor = 0.0f;
+    //! The host replaces the swapchain itself when frame generation turns on or off (a native renderer). The
+    //! plugin then never forces a recreate with VK_SUBOPTIMAL_KHR, and a failed wrap fails the swapchain create.
+    Boolean hostRecreatesSwapchain = Boolean::eFalse;
 SL_STRUCT_END()
 
 //! FSR frame-generation state (mirrors DLSSGState).
@@ -45,6 +48,9 @@ SL_STRUCT_BEGIN(FSRFrameGenState, StructType({ 0xf5d6e708, 0x9102, 0x43b4, { 0xc
     //! per-present flag and reads 1 on any present that had no prepared frame, so sampling it
     //! instantaneously reports an un-doubled multiplier.
     uint64_t totalPresentedFrames{};
+    //! Presents that found a frame prepared for another frame ID. A host that prepares and presents on one
+    //! thread never makes one, so it treats any as fatal.
+    uint64_t foreignPreparedFrames{};
 SL_STRUCT_END()
 
 }
