@@ -9,6 +9,7 @@
 * SL-provided command list. Upscale-only (no frame generation).
 */
 
+#include <cmath>
 #include <map>
 #include <mutex>
 #include <vector>
@@ -52,6 +53,7 @@ struct XeSSApi
     xess_result_t (*vkInit)(xess_context_handle_t, const xess_vk_init_params_t*) = nullptr;
     xess_result_t (*vkExecute)(xess_context_handle_t, VkCommandBuffer, const xess_vk_execute_params_t*) = nullptr;
     xess_result_t (*setVelocityScale)(xess_context_handle_t, float, float) = nullptr;
+    xess_result_t (*setExposureMultiplier)(xess_context_handle_t, float) = nullptr;
     xess_result_t (*destroyContext)(xess_context_handle_t) = nullptr;
     // D3D12 entry points (the same libxess.dll).
     xess_result_t (*d3d12CreateContext)(ID3D12Device*, xess_context_handle_t*) = nullptr;
@@ -129,6 +131,7 @@ bool loadXeSS(xess::XeSSApi& api)
     bool ok =
         resolve(api.module, api.getVersion, "xessGetVersion") &&
         resolve(api.module, api.setVelocityScale, "xessSetVelocityScale") &&
+        resolve(api.module, api.setExposureMultiplier, "xessSetExposureMultiplier") &&
         resolve(api.module, api.destroyContext, "xessDestroyContext");
     if (ok && d3d12)
         ok = resolve(api.module, api.d3d12CreateContext, "xessD3D12CreateContext") &&
@@ -366,11 +369,15 @@ sl::Result xessEndEvaluation(chi::CommandList cmdList, const common::EventData& 
         return Result::eErrorMissingInputParameter;
 
     XeSSMode mode = XeSSMode::eQuality;
+    float preExposure = 1.0f;
     {
         std::lock_guard<std::mutex> lock(ctx.optionsMutex);
         auto it = ctx.options.find((uint32_t)evd.id);
         if (it != ctx.options.end())
+        {
             mode = it->second.mode;
+            preExposure = it->second.preExposure;
+        }
     }
     if (mode == XeSSMode::eOff)
         return Result::eOk;
@@ -387,6 +394,9 @@ sl::Result xessEndEvaluation(chi::CommandList cmdList, const common::EventData& 
     // Set per-frame (not at context creation) because the render size varies with dynamic resolution while
     // the context, keyed on output size + quality, is not recreated.
     ctx.api.setVelocityScale(ctx.xessContext, (float)renderW, (float)renderH);
+    // The host's input color is pre-exposed. Intel's guide: pass the inverse of the pre-exposure as the exposure multiplier,
+    // which XeSS applies on top of its auto-exposure. Set per frame, since the pre-exposure follows the eye adaptation.
+    ctx.api.setExposureMultiplier(ctx.xessContext, 1.0f / preExposure);
 
     // D3D12: the tagged resources as the host left them (inputs readable, the output in UNORDERED_ACCESS).
     if (ctx.platform == RenderAPI::eD3D12)
@@ -466,8 +476,17 @@ sl::Result xessEndEvaluation(chi::CommandList cmdList, const common::EventData& 
 sl::Result slXeSSSetOptions(const sl::ViewportHandle& viewport, const sl::XeSSOptions& options)
 {
     auto& ctx = (*xess::getContext());
+    // A version 1 caller's struct ends before preExposure, so copy the members it has.
+    XeSSOptions stored{};
+    stored.mode = options.mode;
+    stored.outputWidth = options.outputWidth;
+    stored.outputHeight = options.outputHeight;
+    stored.sharpness = options.sharpness;
+    stored.colorBuffersHDR = options.colorBuffersHDR;
+    if (options.structVersion >= kStructVersion2 && std::isfinite(options.preExposure) && options.preExposure > 0.0f)
+        stored.preExposure = options.preExposure;
     std::lock_guard<std::mutex> lock(ctx.optionsMutex);
-    ctx.options[(uint32_t)viewport] = options;
+    ctx.options[(uint32_t)viewport] = stored;
     return Result::eOk;
 }
 

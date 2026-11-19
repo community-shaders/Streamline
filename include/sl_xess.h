@@ -28,7 +28,7 @@ enum class XeSSMode : uint32_t
 };
 
 // {A1B2C3D4-5E6F-4708-8192-A3B4C5D6E7F8}
-SL_STRUCT_BEGIN(XeSSOptions, StructType({ 0xa1b2c3d4, 0x5e6f, 0x4708, { 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8 } }), kStructVersion1)
+SL_STRUCT_BEGIN(XeSSOptions, StructType({ 0xa1b2c3d4, 0x5e6f, 0x4708, { 0x81, 0x92, 0xa3, 0xb4, 0xc5, 0xd6, 0xe7, 0xf8 } }), kStructVersion2)
     //! Quality mode (eOff disables the feature for this viewport).
     XeSSMode mode = XeSSMode::eOff;
     //! Final output (display) target width/height.
@@ -38,6 +38,8 @@ SL_STRUCT_BEGIN(XeSSOptions, StructType({ 0xa1b2c3d4, 0x5e6f, 0x4708, { 0x81, 0x
     float sharpness = 0.0f;
     //! Whether the tagged color buffers are HDR.
     Boolean colorBuffersHDR = Boolean::eFalse;
+    //! Version 2: the factor the host already multiplied into the input color. XeSS takes its inverse as the exposure multiplier.
+    float preExposure = 1.0f;
     //! IMPORTANT: New members go here or chain a new struct (see sl_struct.h).
 SL_STRUCT_END()
 
