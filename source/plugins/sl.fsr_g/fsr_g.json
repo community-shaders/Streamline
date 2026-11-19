@@ -4,7 +4,7 @@
     "name": "sl.fsr_g",
     "namespace": "fsr",
     "required_plugins": ["sl.common"],
-    "rhi": ["vk"],
+    "rhi": ["d3d12", "vk"],
     "external": {
         "vk": {
             "device": {
@@ -46,6 +46,36 @@
             "target": "Present",
             "replacement": "slHookVkQueuePresentKHR",
             "base": "before"
+        },
+        {
+            "class": "IDXGIFactory",
+            "target": "CreateSwapChainForHwnd",
+            "replacement": "slHookDX12CreateSwapChainForHwnd",
+            "base": "before"
+        },
+        {
+            "class": "IDXGISwapChain",
+            "target": "Destroyed",
+            "replacement": "slHookDX12SwapchainDestroyed",
+            "base": "before"
+        },
+        {
+            "class": "IDXGISwapChain",
+            "target": "ResizeBuffers",
+            "replacement": "slHookDX12ResizeBuffers",
+            "base": "before"
+        },
+        {
+            "class": "IDXGISwapChain",
+            "target": "Present",
+            "replacement": "slHookDX12Present",
+            "base": "before"
+        },
+        {
+            "class": "IDXGISwapChain",
+            "target": "Present",
+            "replacement": "slHookDX12AfterPresent",
+            "base": "after"
         }
     ]
 }

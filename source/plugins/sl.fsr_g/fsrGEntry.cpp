@@ -1,6 +1,7 @@
 /*
  * Community Shaders FSR 3 frame-generation Streamline plugin.
- * Uses a dedicated depth, motion-vector, and HUD-less viewport with an FFX Vulkan swapchain.
+ * Uses a dedicated depth, motion-vector, and HUD-less viewport with an FFX Vulkan swapchain, or on D3D12 FFX's DX12
+ * swapchain (fsrGDX12.cpp).
  */
 
 #include <cstring>
@@ -32,21 +33,15 @@
 #include "ffx_api/ffx_framegeneration.h"
 #include "ffx_api/vk/ffx_api_vk.h"
 
+#include "source/plugins/sl.fsr_g/fsrGDX12.h"
+#include "source/plugins/sl.fsr_g/fsrGShared.h"
+
 using json = nlohmann::json;
 
 namespace sl
 {
 namespace fsr
 {
-struct FrameGenerationFrame
-{
-    FfxApiResource hudlessResource{};
-    uint64_t frameID = 0;
-    bool prepared = false;
-    bool haveHudless = false;
-    bool hudlessCompatible = false;
-};
-
 struct FSRContext
 {
     SL_PLUGIN_CONTEXT_CREATE_DESTROY(FSRContext);
@@ -902,6 +897,8 @@ sl::Result fsrBeginEvaluation(chi::CommandList /*pCmdList*/, const common::Event
 sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& evd, const sl::BaseStructure** inputs, uint32_t numInputs)
 {
     auto& ctx = (*fsr::getContext());
+    if (ctx.platform == RenderAPI::eD3D12)
+        return fsr::dx12::endEvaluation(cmdList, evd, inputs, numInputs);
     struct EvaluationGuard
     {
         fsr::FSRContext& ctx;
@@ -1141,6 +1138,8 @@ bool slFSRFrameGenerationOwnsSwapchain(VkSwapchainKHR swapchain)
 bool slFSRFrameGenerationCompleteSwapchainTeardown(bool releaseFeatureContext)
 {
     auto& ctx = *fsr::getContext();
+    if (ctx.platform == RenderAPI::eD3D12)
+        return fsr::dx12::completeSwapchainTeardown(releaseFeatureContext);
     if (!destroyFgSwapchain(ctx))
         return false;
     return !releaseFeatureContext || destroyFgContext(ctx);
@@ -1441,11 +1440,11 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     config.at("appId").get_to(appId);
     config.at("deviceType").get_to(deviceType);
     ctx.platform = (RenderAPI)deviceType;
-    // D3D12 is not supported yet: the plugin turns itself off by name, so the host sees the feature as unavailable
+    // Vulkan and D3D12. Anything else turns the plugin off by name, so the host sees the feature as unavailable
     // instead of evaluations that fail one by one.
-    if (ctx.platform != RenderAPI::eVulkan)
+    if (ctx.platform != RenderAPI::eVulkan && ctx.platform != RenderAPI::eD3D12)
     {
-        SL_LOG_WARN("sl.fsr_g: off, the device is not Vulkan (deviceType %u): FidelityFX's Vulkan backend and its Vulkan frame-interpolation swapchain are the only ones built into it", deviceType);
+        SL_LOG_WARN("sl.fsr_g: off, the device is neither Vulkan nor D3D12 (deviceType %u)", deviceType);
         ctx.registerEvaluateCallbacks(kFeatureFSR_G, nullptr, nullptr);
         return false;
     }
@@ -1454,6 +1453,35 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
     {
         SL_LOG_ERROR("sl.fsr_g: failed to obtain compute interface");
         return false;
+    }
+
+    // D3D12: FidelityFX's DX12 swap chain and prepare (fsrGDX12.cpp), sharing the options, the prepared frame and the counters.
+    if (ctx.platform == RenderAPI::eD3D12)
+    {
+        fsr::SharedState shared{};
+        shared.compute = ctx.compute;
+        shared.optionsMutex = &ctx.optionsMutex;
+        shared.fgEnabled = &ctx.fgEnabled;
+        shared.fgColorHDR = &ctx.fgColorHDR;
+        shared.fgDebugFlags = &ctx.fgDebugFlags;
+        shared.fgOnlyPresentGenerated = &ctx.fgOnlyPresentGenerated;
+        shared.fgPacingSafetyMs = &ctx.fgPacingSafetyMs;
+        shared.fgPacingVariance = &ctx.fgPacingVariance;
+        shared.fgPacingDirty = &ctx.fgPacingDirty;
+        shared.frameMutex = &ctx.frameMutex;
+        shared.pendingFrame = &ctx.pendingFrame;
+        shared.frameID = &ctx.frameID;
+        shared.dispatchFaulted = &ctx.dispatchFaulted;
+        shared.lastPresentedFrameCount = &ctx.lastPresentedFrameCount;
+        shared.totalPresentedFrames = &ctx.totalPresentedFrames;
+        shared.foreignPreparedFrames = &ctx.foreignPreparedFrames;
+        if (!fsr::dx12::startup(shared))
+        {
+            ctx.registerEvaluateCallbacks(kFeatureFSR_G, nullptr, nullptr);
+            return false;
+        }
+        SL_LOG_INFO("sl.fsr_g plugin started (D3D12)");
+        return true;
     }
 
     // Resolve un-interposed device functions for the FFX backend and barriers from the genuine
@@ -1491,6 +1519,13 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 void slOnPluginShutdown()
 {
     auto& ctx = (*fsr::getContext());
+    if (ctx.platform == RenderAPI::eD3D12) {
+        if (!fsr::dx12::shutdown())
+            return;
+        ctx.registerEvaluateCallbacks(kFeatureFSR_G, nullptr, nullptr);
+        plugin::onShutdown(api::getContext());
+        return;
+    }
     if (!destroyFgSwapchain(ctx) || !destroyFgContext(ctx)) {
         SL_LOG_ERROR("sl.fsr_g: retaining FFX runtime after failed context teardown");
         return;
@@ -1551,6 +1586,13 @@ SL_EXPORT void* slGetPluginFunction(const char* functionName)
     SL_EXPORT_FUNCTION(slHookVkGetSwapchainImagesKHR);
     SL_EXPORT_FUNCTION(slHookVkAcquireNextImageKHR);
     SL_EXPORT_FUNCTION(slHookVkQueuePresentKHR);
+
+    // DXGI hooks (D3D12, fsrGDX12.cpp).
+    SL_EXPORT_FUNCTION(slHookDX12CreateSwapChainForHwnd);
+    SL_EXPORT_FUNCTION(slHookDX12SwapchainDestroyed);
+    SL_EXPORT_FUNCTION(slHookDX12Present);
+    SL_EXPORT_FUNCTION(slHookDX12AfterPresent);
+    SL_EXPORT_FUNCTION(slHookDX12ResizeBuffers);
 
     return nullptr;
 }
