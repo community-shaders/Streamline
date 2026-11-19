@@ -88,6 +88,8 @@ struct FSRContext
     bool fgColorHDR = false;
     uint32_t fgDebugFlags = 0;               // FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_* from the host's debug toggles
     bool fgOnlyPresentGenerated = false;     // present only generated frames (host fgShowOnlyGenerated)
+    // The host replaces the swapchain itself (FSRFrameGenOptions::hostRecreatesSwapchain). Guarded by optionsMutex.
+    bool fgHostRecreates = false;
     // FFX frame-pacing tuning requested by the host. Guarded by optionsMutex like the flags above.
     // Applied at swapchain creation and re-applied whenever the host changes it (the frame-rate cap
     // changes which values are right), so it does not need a swapchain recreate.
@@ -1081,6 +1083,7 @@ sl::Result slFSRFrameGenerationSetOptions(const sl::ViewportHandle& viewport, co
             (options.debugTearLines == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES : 0u) |
             (options.debugPacingLines == Boolean::eTrue ? (uint32_t)FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES : 0u);
         ctx.fgOnlyPresentGenerated = options.onlyPresentGenerated == Boolean::eTrue;
+        ctx.fgHostRecreates = options.hostRecreatesSwapchain == Boolean::eTrue;
         // Zero means "leave as configured" so a host that never sets these keeps FFX's defaults.
         if (options.pacingSafetyMarginMs > 0.0f || options.pacingVarianceFactor > 0.0f) {
             if (options.pacingSafetyMarginMs != ctx.fgPacingSafetyMs ||
@@ -1116,6 +1119,7 @@ sl::Result slFSRGetFrameGenState(const sl::ViewportHandle& /*viewport*/, sl::FSR
     state.status = 0;
     state.numFramesActuallyPresented = ctx.lastPresentedFrameCount.load(std::memory_order_acquire);
     state.totalPresentedFrames = ctx.totalPresentedFrames.load(std::memory_order_acquire);
+    state.foreignPreparedFrames = ctx.foreignPreparedFrames.load(std::memory_order_acquire);
     state.estimatedVRAMUsageInBytes = 0;
     return Result::eOk;
 }
@@ -1217,9 +1221,15 @@ VkResult slHookVkCreateSwapchainKHR(VkDevice Device, const VkSwapchainCreateInfo
             Skip = true;
             return VK_NOT_READY;
         }
+        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
+        // A host that replaces the swapchain itself asked for a wrapped one, so a plain one would be a silent failure.
+        if (ctx.fgHostRecreates) {
+            SL_LOG_ERROR("sl.fsr_g: FG swapchain proxy failed; the host recreates swapchains, so the create fails");
+            Skip = true;
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
         SL_LOG_WARN("sl.fsr_g: FG swapchain proxy failed; falling back to a normal swapchain");
         Skip = false;
-        std::lock_guard<std::mutex> lock(ctx.optionsMutex);
         ctx.fgWrapFailed = true;  // don't loop on the bootstrap recreate
     }
     return VK_SUCCESS;
@@ -1301,7 +1311,7 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
         fgEnabled = ctx.fgEnabled;
         fgDebugFlags = ctx.fgDebugFlags;
         fgOnlyPresentGenerated = ctx.fgOnlyPresentGenerated;
-        needRecreate = ctx.fgGameplayReached.load(std::memory_order_acquire) &&
+        needRecreate = !ctx.fgHostRecreates && ctx.fgGameplayReached.load(std::memory_order_acquire) &&
             !ctx.fgBootstrapInFlight && !ctx.fgWrapFailed &&
             ((fgEnabled && ctx.fgWrappedSwapchain == VK_NULL_HANDLE && !wrapped) ||
              (!fgEnabled && wrapped));
@@ -1344,7 +1354,7 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
         applyFramePacingTuning(ctx);
 
     // The host's contract: frame N's prepare is recorded after present N-1 and before present N. A prepared frame
-    // for another frame ID is a host error. It is passed through and logged.
+    // for another frame ID is a host error. It is passed through, logged and counted in FSRFrameGenState.
     fsr::FrameGenerationFrame frame{};
     uint64_t frameID = 0;
     uint64_t foreignFrameID = 0;
