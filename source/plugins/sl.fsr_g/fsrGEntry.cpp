@@ -78,6 +78,8 @@ struct FSRContext
     // Running total of presented frames (real + generated); the host differences it for the true
     // post-FG rate. See FSRFrameGenState::totalPresentedFrames.
     std::atomic<uint64_t> totalPresentedFrames{ 0 };
+    // Presents that found a frame prepared for another frame ID: a host error (the present hook).
+    std::atomic<uint64_t> foreignPreparedFrames{ 0 };
 
     // --- Frame generation (FFX FrameInterpolationSwapChainVK proxy) -----------------------------
     // The present hook recreates the swapchain when FSR FG takes or releases ownership. While wrapped,
@@ -1341,14 +1343,29 @@ VkResult slHookVkQueuePresentKHR(VkQueue Queue, const VkPresentInfoKHR* PresentI
     if (ctx.fgPacingDirty.exchange(false, std::memory_order_acq_rel))
         applyFramePacingTuning(ctx);
 
+    // The host's contract: frame N's prepare is recorded after present N-1 and before present N. A prepared frame
+    // for another frame ID is a host error. It is passed through and logged.
     fsr::FrameGenerationFrame frame{};
     uint64_t frameID = 0;
+    uint64_t foreignFrameID = 0;
+    bool foreign = false;
     {
         std::lock_guard<std::mutex> lock(ctx.frameMutex);
         frameID = ctx.frameID++;
-        if (ctx.pendingFrame.prepared && ctx.pendingFrame.frameID == frameID)
+        if (ctx.pendingFrame.prepared && ctx.pendingFrame.frameID == frameID) {
             frame = ctx.pendingFrame;
+        } else if (ctx.pendingFrame.prepared) {
+            foreign = true;
+            foreignFrameID = ctx.pendingFrame.frameID;
+        }
         ctx.pendingFrame = {};
+    }
+    if (foreign) {
+        const uint64_t count = ctx.foreignPreparedFrames.fetch_add(1, std::memory_order_acq_rel) + 1;
+        // The first one, then one line in 600, since a broken host does this every frame.
+        if (count == 1 || count % 600 == 0)
+            SL_LOG_ERROR("sl.fsr_g: present %llu found a frame prepared for frame %llu (host error, %llu so far); passed through",
+                (unsigned long long)frameID, (unsigned long long)foreignFrameID, (unsigned long long)count);
     }
 
     // Interpolate only after evaluation prepared and accepted every resource for this frame.
