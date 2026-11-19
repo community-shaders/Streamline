@@ -11,6 +11,7 @@
 
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include "include/sl.h"
 #include "include/sl_consts.h"
@@ -74,6 +75,8 @@ struct XeSSContext
     uint32_t ctxOutputWidth = 0, ctxOutputHeight = 0;
     XeSSMode ctxMode = XeSSMode::eOff;
     bool dispatchFaulted = false;
+    // Replaced contexts and the frame they were replaced on. Frames still in flight may run them.
+    std::vector<std::pair<xess_context_handle_t, uint32_t>> retired;
     PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier = nullptr;
 
     std::mutex optionsMutex;
@@ -164,15 +167,44 @@ xess_quality_settings_t mapQuality(XeSSMode mode)
     }
 }
 
-//! (Re)create the XeSS context for the requested output size + quality. Returns false on failure.
-bool ensureContext(xess::XeSSContext& ctx, uint32_t outputWidth, uint32_t outputHeight, XeSSMode mode)
+//! Frames a replaced context is kept: the host's 4 frames in flight plus 4 frames of margin.
+constexpr uint32_t kRetireFrames = 8;
+
+//! Destroys the retired contexts no frame in flight can still run. All of them when all is set (shutdown).
+bool destroyRetired(xess::XeSSContext& ctx, uint32_t frame, bool all)
 {
+    bool ok = true;
+    auto keep = ctx.retired.begin();
+    for (auto& entry : ctx.retired)
+    {
+        if (!all && frame - entry.second < kRetireFrames)
+        {
+            *keep++ = entry;
+            continue;
+        }
+        const xess_result_t r = ctx.api.destroyContext(entry.first);
+        if (r != XESS_RESULT_SUCCESS)
+        {
+            SL_LOG_ERROR("sl.xess: xessDestroyContext failed (%d) for a retired context", (int)r);
+            ok = false;
+        }
+    }
+    ctx.retired.erase(keep, ctx.retired.end());
+    return ok;
+}
+
+//! (Re)create the XeSS context for the requested output size + quality. Returns false on failure.
+bool ensureContext(xess::XeSSContext& ctx, uint32_t outputWidth, uint32_t outputHeight, XeSSMode mode, uint32_t frame)
+{
+    if (!destroyRetired(ctx, frame, false))
+        return false;
     if (ctx.xessContext && ctx.ctxOutputWidth == outputWidth && ctx.ctxOutputHeight == outputHeight && ctx.ctxMode == mode)
         return true;
 
+    // Earlier frames may still run the old context on the GPU, so it is destroyed kRetireFrames later.
     if (ctx.xessContext)
     {
-        ctx.api.destroyContext(ctx.xessContext);
+        ctx.retired.emplace_back(ctx.xessContext, frame);
         ctx.xessContext = nullptr;
     }
 
@@ -228,7 +260,7 @@ bool ensureContext(xess::XeSSContext& ctx, uint32_t outputWidth, uint32_t output
     }
     if (r != XESS_RESULT_SUCCESS)
     {
-        SL_LOG_ERROR("sl.xess: xessVKInit failed (%d)", (int)r);
+        SL_LOG_ERROR("sl.xess: %s failed (%d)", d3d12 ? "xessD3D12Init" : "xessVKInit", (int)r);
         ctx.api.destroyContext(ctx.xessContext);
         ctx.xessContext = nullptr;
         return false;
@@ -343,7 +375,7 @@ sl::Result xessEndEvaluation(chi::CommandList cmdList, const common::EventData& 
     if (mode == XeSSMode::eOff)
         return Result::eOk;
 
-    if (!ensureContext(ctx, outputW, outputH, mode))
+    if (!ensureContext(ctx, outputW, outputH, mode, (uint32_t)evd.frame))
     {
         ctx.dispatchFaulted = true;
         return Result::eErrorExceptionHandler;
@@ -542,8 +574,14 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 void slOnPluginShutdown()
 {
     auto& ctx = (*xess::getContext());
-    if (ctx.xessContext && ctx.api.destroyContext)
-        ctx.api.destroyContext(ctx.xessContext);
+    // Streamline's shutdown contract: the host has finished all GPU work, so every context can go now.
+    if (ctx.api.destroyContext)
+    {
+        destroyRetired(ctx, 0, true);
+        if (ctx.xessContext)
+            ctx.api.destroyContext(ctx.xessContext);
+    }
+    ctx.retired.clear();
     ctx.xessContext = nullptr;
     if (ctx.api.module)
         FreeLibrary(ctx.api.module);

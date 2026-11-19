@@ -63,6 +63,8 @@ struct FSRContext
     uint32_t ctxRenderW = 0, ctxRenderH = 0, ctxDisplayW = 0, ctxDisplayH = 0;
     bool ctxColorHDR = false;
     bool dispatchFaulted = false;
+    // Replaced contexts and the frame they were replaced on. Frames still in flight may run them.
+    std::vector<std::pair<ffxContext, uint32_t>> retiredContexts;
 
     // Resolved device functions for the FFX backend + our barriers.
     PFN_vkGetDeviceProcAddr realDeviceProcAddr = nullptr;
@@ -210,14 +212,40 @@ bool loadFFX(fsr::FSRContext& ctx)
     return true;
 }
 
-bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t renderH,
-    uint32_t displayW, uint32_t displayH, bool colorHDR)
+// Frames a replaced context is kept: the host's 4 frames in flight plus 4 frames of margin.
+constexpr uint32_t kRetireFrames = 8;
+
+// Destroys the retired contexts no frame in flight can still run. All of them when all is set (shutdown).
+bool destroyRetired(fsr::FSRContext& ctx, uint32_t frame, bool all)
 {
+    bool ok = true;
+    auto keep = ctx.retiredContexts.begin();
+    for (auto& entry : ctx.retiredContexts) {
+        if (!all && frame - entry.second < kRetireFrames) {
+            *keep++ = entry;
+            continue;
+        }
+        const ffxReturnCode_t rc = ctx.ffxApi.DestroyContext(&entry.first, nullptr);
+        if (rc != FFX_API_RETURN_OK) {
+            SL_LOG_ERROR("sl.fsr: DestroyContext failed 0x%08X for a retired context", (uint32_t)rc);
+            ok = false;
+        }
+    }
+    ctx.retiredContexts.erase(keep, ctx.retiredContexts.end());
+    return ok;
+}
+
+bool ensureUpscaleContext(fsr::FSRContext& ctx, uint32_t renderW, uint32_t renderH,
+    uint32_t displayW, uint32_t displayH, bool colorHDR, uint32_t frame)
+{
+    if (!destroyRetired(ctx, frame, false))
+        return false;
     if (ctx.upscaleContext && ctx.ctxRenderW >= renderW && ctx.ctxRenderH >= renderH &&
         ctx.ctxDisplayW == displayW && ctx.ctxDisplayH == displayH && ctx.ctxColorHDR == colorHDR)
         return true;
+    // Earlier frames may still run the old context on the GPU, so it is destroyed kRetireFrames later.
     if (ctx.upscaleContext) {
-        ctx.ffxApi.DestroyContext(&ctx.upscaleContext, nullptr);
+        ctx.retiredContexts.emplace_back(ctx.upscaleContext, frame);
         ctx.upscaleContext = nullptr;
     }
 
@@ -350,7 +378,7 @@ sl::Result fsrEndEvaluation(chi::CommandList cmdList, const common::EventData& e
             colorHDR = it->second.colorBuffersHDR == Boolean::eTrue;
         }
     }
-    if (!ensureUpscaleContext(ctx, renderW, renderH, outputW, outputH, colorHDR)) {
+    if (!ensureUpscaleContext(ctx, renderW, renderH, outputW, outputH, colorHDR, (uint32_t)evd.frame)) {
         ctx.dispatchFaulted = true;
         return Result::eErrorExceptionHandler;
     }
@@ -540,8 +568,13 @@ bool slOnPluginStartup(const char* jsonConfig, void* device)
 void slOnPluginShutdown()
 {
     auto& ctx = (*fsr::getContext());
-    if (ctx.upscaleContext && ctx.ffxApi.DestroyContext)
-        ctx.ffxApi.DestroyContext(&ctx.upscaleContext, nullptr);
+    // Streamline's shutdown contract: the host has finished all GPU work, so every context can go now.
+    if (ctx.ffxApi.DestroyContext) {
+        destroyRetired(ctx, 0, true);
+        if (ctx.upscaleContext)
+            ctx.ffxApi.DestroyContext(&ctx.upscaleContext, nullptr);
+    }
+    ctx.retiredContexts.clear();
     ctx.upscaleContext = nullptr;
     if (ctx.ffxModule)
         FreeLibrary(ctx.ffxModule);
